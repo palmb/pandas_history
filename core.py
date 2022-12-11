@@ -23,23 +23,23 @@ class FullSeriesHistory:
             - index to remove
             - index+value to add
             - index+value to modify
-        if add+mod > BASE_FAKTOR * last series,
+        if length of add+mod > BASE_FACTOR * length of last series - rm,
         we store the entire new series
     """
 
-    BASE_FAKTOR = 0.5
+    BASE_FACTOR = 0.6
     __change_keys = {"add", "rm", "mod", "dtype"}
 
     def __init__(self, s: pd.Series | None = None, copy=True):
-        self._bases = []
-        self._changes = []
+        # _bases: stores the base or the index of the last base in the list
+        # _changes: stores a dict of changes or None for no changes
+        # _current: is a reference or a copy of current value of the series
+        self._bases: list[pd.Series | int] = []
+        self._changes: list[dict[str, pd.Series | pd.Index | None] | None] = []
         self._current: pd.Series | None = None
         if s is None:
-            s = pd.Series(dtype=float)
-            copy = False
-        if copy:
-            s = s.copy()
-        self._set_new_base(s)
+            s, copy = pd.Series(dtype=float), False
+        self._set_new_base(s.copy() if copy else s)
 
     def __len__(self):
         return len(self._bases)
@@ -55,12 +55,6 @@ class FullSeriesHistory:
         return range(len(self) if sz is None else sz)[int(i)]
 
     def update(self, series: pd.Series, copy=True):
-        """
-        skipna: bool
-            Ignore nan's
-            Only update valid values. In other words,
-            keep the previous value if the given series is NaN.
-        """
         assert isinstance(series, pd.Series)
         s = series.copy(deep=copy)
         logging.debug(f"len: {len(s)}")
@@ -70,26 +64,25 @@ class FullSeriesHistory:
         mod = self._get_modified(s)
 
         logging.debug(
-            f"rm: {len(rm)}, add: {len(add)}, mod: {len(mod)} => {len(mod) + len(add)} >? {self.BASE_FAKTOR * (len(self._current) - len(rm))}")
+            f"rm: {len(rm)}, add: {len(add)}, mod: {len(mod)} => {len(mod) + len(add)} >? {self.BASE_FACTOR * (len(self._current) - len(rm))}"
+        )
 
-        if len(mod) + len(add) > self.BASE_FAKTOR * (len(self._current) - len(rm)):
+        if len(mod) + len(add) > self.BASE_FACTOR * (len(self._current) - len(rm)):
             return self._set_new_base(s)
 
         to_update = dict()
         if not rm.empty:
-            to_update['rm'] = rm
+            to_update["rm"] = rm
         if not add.empty:
-            to_update['add'] = add
+            to_update["add"] = add
         if not mod.empty:
-            to_update['mod'] = mod
+            to_update["mod"] = mod
         if s.dtype != self._current.dtype:
-            to_update['dtype'] = s.dtype
+            to_update["dtype"] = s.dtype
 
         assert s.equals(self._apply(self._current.copy(), to_update))
-
         if not to_update:
             return self._update(None)
-
         return self._update(to_update)
 
     def _get_modified(self, s):
@@ -130,18 +123,17 @@ class FullSeriesHistory:
         base = self._bases[base_i]
         assert isinstance(base, pd.Series)
         result = base.copy()
-        changes = [d for d in self._changes[base_i + 1: i + 1] if d is not None]
+        changes = [d for d in self._changes[base_i + 1 : i + 1] if d is not None]
         for change in changes:
-            assert isinstance(change, dict)
             result = self._apply(result, change)
         return result
 
     @staticmethod
     def _apply(base: pd.Series, change):
-        rm: pd.Index = change.get('rm')
+        rm: pd.Index = change.get("rm")
         add: pd.Series = change.get("add")
-        mod: pd.Series = change.get('mod')
-        dtype = change.get('dtype')
+        mod: pd.Series = change.get("mod")
+        dtype = change.get("dtype")
         if rm is not None:
             base = base.drop(rm)
         if dtype is not None:
@@ -153,7 +145,7 @@ class FullSeriesHistory:
             base.loc[mod.index] = mod
         # works with None, ensure inserts did not change dtype
         if dtype is not None:
-            base = base.drop(rm)
+            base = base.astype(dtype)
         return base
 
     def pprint(self):
@@ -170,7 +162,6 @@ class FullSeriesHistory:
         bases = self._bases
         columns = [i if isinstance(bases[i], int) else f"{i}(base)" for i in df.columns]
         df.columns = columns
-
         print(df)
 
     def __repr__(self):
