@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 from functools import reduce
+from typing import final
 
 import numpy as np
 import pandas as pd
 
 
-class FullSeriesHistory:
+class SeriesHistory:
     """
     History of a Series:
         - update(series): add new info -> new History
@@ -39,7 +40,8 @@ class FullSeriesHistory:
         self._current: pd.Series | None = None
         if s is None:
             s, copy = pd.Series(dtype=float), False
-        self._set_new_base(s.copy() if copy else s)
+        s = self._prepare_input(s, copy=copy)
+        self._set_new_base(s)
 
     def __len__(self):
         return len(self._bases)
@@ -54,14 +56,19 @@ class FullSeriesHistory:
         """may raise IndexError for index out of range."""
         return range(len(self) if sz is None else sz)[int(i)]
 
-    def update(self, series: pd.Series, copy=True):
-        assert isinstance(series, pd.Series)
-        s = series.copy(deep=copy)
-        logging.debug(f"len: {len(s)}")
+    def _prepare_input(self, obj, copy=True, **kwargs) -> pd.Series:
+        assert isinstance(obj, pd.Series)
+        logging.debug(f"len: {len(obj)}")
+        if copy:
+            obj = obj.copy()
+        return obj
 
-        rm = self._current.index.difference(s.index)
-        add = s.reindex(s.index.difference(self._current.index))
-        mod = self._get_modified(s)
+    def update(self, series: pd.Series, copy=True, **kwargs):
+        s = self._prepare_input(series, copy=copy, **kwargs)
+        rm = self._get_rm(s, **kwargs)
+        add = self._get_add(s, **kwargs)
+        mod = self._get_modified(s, **kwargs)
+        dtype = self._get_dtype(s, **kwargs)
 
         logging.debug(
             f"rm: {len(rm)}, add: {len(add)}, mod: {len(mod)} => {len(mod) + len(add)} >? {self.BASE_FACTOR * (len(self._current) - len(rm))}"
@@ -77,15 +84,32 @@ class FullSeriesHistory:
             to_update["add"] = add
         if not mod.empty:
             to_update["mod"] = mod
-        if s.dtype != self._current.dtype:
-            to_update["dtype"] = s.dtype
+        if dtype != self._current.dtype:
+            to_update["dtype"] = dtype
+        to_update = to_update or None
 
-        assert s.equals(self._apply(self._current.copy(), to_update))
-        if not to_update:
-            return self._update(None)
-        return self._update(to_update)
+        try:
+            assert s.equals(self._apply(self._current.copy(), to_update))
+        except AssertionError as e:
+            logging.debug(f"not equal", exc_info=e)
+            to_update = s
+        except (TypeError, IndexError, ValueError, KeyError) as e:
+            logging.debug(f"_apply failed", exc_info=e)
+            to_update = s
+        finally:
+            self._update(to_update)
+        return self
 
-    def _get_modified(self, s):
+    def _get_rm(self, s, **kwargs) -> pd.Index:
+        return self._current.index.difference(s.index)
+
+    def _get_add(self, s, **kwargs) -> pd.Series:
+        return s.reindex(s.index.difference(self._current.index))
+
+    def _get_dtype(self, s, **kwargs):
+        return s.dtype
+
+    def _get_modified(self, s, **kwargs) -> pd.Series:
         common = s.index.intersection(self._current.index)
         s, c = s.reindex(common), self._current.reindex(common)
         both_nan = c.isna() & s.isna()
@@ -94,7 +118,7 @@ class FullSeriesHistory:
         logging.debug(f"identical: {len(identical[identical])}")
         return s.loc[value_change]
 
-    def _update(self, base_or_change):
+    def _update(self, base_or_change) -> None:
         """insert base or change-dict and set '_current'."""
         if isinstance(base_or_change, pd.Series):  # a new base
             self._bases.append(base_or_change)
@@ -109,10 +133,10 @@ class FullSeriesHistory:
 
     _set_new_base = _update  # alias
 
-    def get(self):
+    def get(self) -> pd.Series:
         return self.restore(i=None)
 
-    def restore(self, i=None):
+    def restore(self, i=None) -> pd.Series:
         if i is None:
             return self._current.copy()
         try:
@@ -128,25 +152,31 @@ class FullSeriesHistory:
             result = self._apply(result, change)
         return result
 
-    @staticmethod
-    def _apply(base: pd.Series, change):
+    def _apply(self, base: pd.Series, change: dict | None) -> pd.Series:
+        """ may change base, copy explicitly before if needed. """
+        if change is None:
+            return base
         rm: pd.Index = change.get("rm")
         add: pd.Series = change.get("add")
         mod: pd.Series = change.get("mod")
         dtype = change.get("dtype")
-        if rm is not None:
-            base = base.drop(rm)
-        if dtype is not None:
-            base = base.astype(dtype)
+        index = self._construct_index(base, add, rm)
+        base = base.reindex(index)
         if add is not None:
-            base = base.reindex(base.index.union(add.index))
             base.loc[add.index] = add
         if mod is not None:
             base.loc[mod.index] = mod
-        # works with None, ensure inserts did not change dtype
         if dtype is not None:
             base = base.astype(dtype)
         return base
+
+    def _construct_index(self, s: pd.Series, add: pd.Series, rm: pd.Index) -> pd.Index:
+        index = s.index
+        if rm is not None:
+            index = index.difference(rm)
+        if add is not None:
+            index = index.union(add.index)
+        return index.sort_values()
 
     def pprint(self):
         serieses = []
@@ -177,7 +207,7 @@ def get_size(obj):
 def foo():
     i0 = pd.date_range("2000", None, 20)
     s0 = pd.Series(np.nan, index=i0, dtype=float)
-    h = FullSeriesHistory(s0)
+    h = SeriesHistory(s0)
     print(get_size(h))
 
     # flag all stuff, change dtype
@@ -228,7 +258,7 @@ def foo():
 def identical_test():
     i0 = pd.date_range("2000", None, 20)
     s0 = pd.Series(np.nan, index=i0, dtype=float)
-    h = FullSeriesHistory(s0)
+    h = SeriesHistory(s0)
     s1 = s0.copy()
     s1.iloc[:4] = 99
     h.update(s1)
